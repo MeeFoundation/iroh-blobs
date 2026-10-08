@@ -809,17 +809,30 @@ fn err_entity_dead() -> io::Error {
     io::Error::other("entity is dead")
 }
 
-struct RtWrapper(Option<tokio::runtime::Runtime>);
+/// Numbers the runtimes [`FsStore::load_with_opts`] builds, so a thread can
+/// tell whether it belongs to the runtime being dropped.
+static RUNTIME_NR: AtomicU64 = AtomicU64::new(0);
 
-impl From<tokio::runtime::Runtime> for RtWrapper {
-    fn from(rt: tokio::runtime::Runtime) -> Self {
-        Self(Some(rt))
+thread_local! {
+    /// The number of the store runtime this thread belongs to, if any.
+    static OWN_RUNTIME: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+struct RtWrapper {
+    rt: Option<tokio::runtime::Runtime>,
+    nr: u64,
+}
+
+impl RtWrapper {
+    /// `rt` must mark its threads with `nr` in [`OWN_RUNTIME`].
+    fn new(rt: tokio::runtime::Runtime, nr: u64) -> Self {
+        Self { rt: Some(rt), nr }
     }
 }
 
 impl fmt::Debug for RtWrapper {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        ValueOrPoisioned(self.0.as_ref()).fmt(f)
+        ValueOrPoisioned(self.rt.as_ref()).fmt(f)
     }
 }
 
@@ -827,19 +840,27 @@ impl Deref for RtWrapper {
     type Target = tokio::runtime::Runtime;
 
     fn deref(&self) -> &Self::Target {
-        self.0.as_ref().unwrap()
+        self.rt.as_ref().unwrap()
     }
 }
 
 impl Drop for RtWrapper {
     fn drop(&mut self) {
-        if let Some(rt) = self.0.take() {
-            trace!("dropping tokio runtime");
-            tokio::task::block_in_place(|| {
-                drop(rt);
-            });
-            trace!("dropped tokio runtime");
+        let Some(rt) = self.rt.take() else {
+            return;
+        };
+        if OWN_RUNTIME.with(|own| own.get()) == Some(self.nr) {
+            // Dropping the runtime waits for every one of its threads to
+            // stop, this one included, and so would never return.
+            trace!("shutting down tokio runtime from one of its own threads");
+            rt.shutdown_background();
+            return;
         }
+        trace!("dropping tokio runtime");
+        tokio::task::block_in_place(|| {
+            drop(rt);
+        });
+        trace!("dropped tokio runtime");
     }
 }
 
@@ -1397,6 +1418,7 @@ impl FsStore {
     /// Load or create a new store with custom options, returning an additional sender for file store specific commands.
     pub async fn load_with_opts(db_path: PathBuf, options: Options) -> Result<FsStore> {
         static THREAD_NR: AtomicU64 = AtomicU64::new(0);
+        let runtime_nr = RUNTIME_NR.fetch_add(1, Ordering::Relaxed);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .thread_name_fn(|| {
                 format!(
@@ -1404,6 +1426,7 @@ impl FsStore {
                     THREAD_NR.fetch_add(1, Ordering::Relaxed)
                 )
             })
+            .on_thread_start(move || OWN_RUNTIME.with(|own| own.set(Some(runtime_nr))))
             .enable_time()
             .build()?;
         let handle = rt.handle().clone();
@@ -1413,7 +1436,7 @@ impl FsStore {
         let actor = handle
             .spawn(Actor::new(
                 db_path,
-                rt.into(),
+                RtWrapper::new(rt, runtime_nr),
                 commands_rx,
                 fs_commands_rx,
                 fs_commands_tx.clone(),
@@ -1569,6 +1592,46 @@ pub mod tests {
             store.import_bao_bytes(hash, ranges, bao).await?;
             task.await??;
         }
+        Ok(())
+    }
+
+    /// A store whose database another store holds fails to load with the
+    /// reason, rather than hanging: the failed open stops the store's runtime
+    /// from one of that runtime's own threads.
+    #[tokio::test]
+    async fn test_load_on_a_held_database_returns_the_error() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let db_dir = testdir.path().join("db");
+        let db_path = db_dir.join("blobs.db");
+        let _held = FsStore::load_with_opts(db_path.clone(), Options::new(&db_dir)).await?;
+        let second = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            FsStore::load_with_opts(db_path, Options::new(&db_dir)),
+        )
+        .await
+        .expect("a load on a held database hung instead of failing");
+        let err = second.expect_err("a second store opened a held database");
+        assert!(
+            format!("{err:?}").to_lowercase().contains("already open"),
+            "the error does not name the held database: {err:?}"
+        );
+        Ok(())
+    }
+
+    /// A store whose directory cannot be created fails to load rather than
+    /// hanging.
+    #[tokio::test]
+    async fn test_load_on_an_unusable_directory_returns_the_error() -> TestResult<()> {
+        let testdir = tempfile::tempdir()?;
+        let db_dir = testdir.path().join("db");
+        std::fs::write(&db_dir, b"a file where the store's directory goes")?;
+        let loaded = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            FsStore::load_with_opts(db_dir.join("blobs.db"), Options::new(&db_dir)),
+        )
+        .await
+        .expect("a load on an unusable directory hung instead of failing");
+        assert!(loaded.is_err(), "a store opened on an unusable directory");
         Ok(())
     }
 
